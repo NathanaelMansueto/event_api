@@ -1,11 +1,18 @@
 import os
 from typing import Optional, List, Any, Dict
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse
+from datetime import datetime
+import io
+from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 
 from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
 import motor.motor_asyncio
 from bson import ObjectId
 from pydantic import BaseModel, Field, ConfigDict
+from fastapi import FastAPI, HTTPException, UploadFile, File
+
 
 load_dotenv()
 
@@ -16,7 +23,9 @@ if not MONGO_URI:
     raise RuntimeError("MONGO_URI is missing in .env")
 
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-db = client["event_management_db"]  # must match Atlas DB name
+db = client["event_management_db"] 
+fs = AsyncIOMotorGridFSBucket(db, bucket_name="media")
+
 
 
 # Helpers
@@ -337,3 +346,130 @@ async def delete_booking(booking_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Booking not found")
     return {"deleted": True, "id": booking_id}
+
+# ---------- MEDIA (GridFS + metadata collection) ----------
+async def _ensure_exists(collection: str, oid: ObjectId, not_found_msg: str):
+    doc = await db[collection].find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail=not_found_msg)
+
+
+async def _upload_media(owner_type: str, owner_oid: ObjectId, media_type: str, file: UploadFile) -> dict:
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    # Store file in GridFS (media.files + media.chunks)
+    file_id = await fs.upload_from_stream(
+        file.filename,
+        io.BytesIO(content)
+    )
+
+    # Store metadata + link in a normal collection (media_files)
+    meta = {
+        "owner_type": owner_type,            # "event" or "venue"
+        "owner_id": owner_oid,               # ObjectId of event/venue
+        "media_type": media_type,            # "poster" / "promo_video" / "venue_photo"
+        "filename": file.filename,
+        "content_type": file.content_type or "application/octet-stream",
+        "file_id": file_id,                  # GridFS file id
+        "uploaded_at": datetime.utcnow()
+    }
+
+    # Keep only one record per owner+media_type (overwrite if re-upload)
+    await db["media_files"].update_one(
+        {"owner_type": owner_type, "owner_id": owner_oid, "media_type": media_type},
+        {"$set": meta},
+        upsert=True
+    )
+
+    saved = await db["media_files"].find_one(
+        {"owner_type": owner_type, "owner_id": owner_oid, "media_type": media_type}
+    )
+    return serialize(saved)
+
+
+async def _download_media(owner_type: str, owner_oid: ObjectId, media_type: str):
+    meta = await db["media_files"].find_one(
+        {"owner_type": owner_type, "owner_id": owner_oid, "media_type": media_type}
+    )
+    if not meta:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    grid_out = await fs.open_download_stream(meta["file_id"])
+
+    async def iterator():
+        while True:
+            chunk = await grid_out.readchunk()
+            if not chunk:
+                break
+            yield chunk
+
+    headers = {
+        "Content-Disposition": f'inline; filename="{meta.get("filename", "file")}"'
+    }
+    return StreamingResponse(
+        iterator(),
+        media_type=meta.get("content_type", "application/octet-stream"),
+        headers=headers
+    )
+
+
+# Upload Event Poster (Image)
+@app.post("/upload_event_poster/{event_id}")
+async def upload_event_poster(event_id: str, file: UploadFile = File(...)):
+    event_oid = to_object_id(event_id)
+    await _ensure_exists("events", event_oid, "Event not found")
+
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Poster must be an image")
+
+    return await _upload_media("event", event_oid, "poster", file)
+
+
+# Retrieve Event Poster
+@app.get("/event_poster/{event_id}")
+async def get_event_poster(event_id: str):
+    event_oid = to_object_id(event_id)
+    await _ensure_exists("events", event_oid, "Event not found")
+    return await _download_media("event", event_oid, "poster")
+
+
+# Upload Promotional Video
+@app.post("/upload_promo_video/{event_id}")
+async def upload_promo_video(event_id: str, file: UploadFile = File(...)):
+    event_oid = to_object_id(event_id)
+    await _ensure_exists("events", event_oid, "Event not found")
+
+    if not (file.content_type or "").startswith("video/"):
+        raise HTTPException(status_code=400, detail="Promo video must be a video file")
+
+    return await _upload_media("event", event_oid, "promo_video", file)
+
+
+# Retrieve Promotional Video
+@app.get("/promo_video/{event_id}")
+async def get_promo_video(event_id: str):
+    event_oid = to_object_id(event_id)
+    await _ensure_exists("events", event_oid, "Event not found")
+    return await _download_media("event", event_oid, "promo_video")
+
+
+# Upload Venue Photo (Image)
+@app.post("/upload_venue_photo/{venue_id}")
+async def upload_venue_photo(venue_id: str, file: UploadFile = File(...)):
+    venue_oid = to_object_id(venue_id)
+    await _ensure_exists("venues", venue_oid, "Venue not found")
+
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Venue photo must be an image")
+
+    return await _upload_media("venue", venue_oid, "venue_photo", file)
+
+
+# Retrieve Venue Photo
+@app.get("/venue_photo/{venue_id}")
+async def get_venue_photo(venue_id: str):
+    venue_oid = to_object_id(venue_id)
+    await _ensure_exists("venues", venue_oid, "Venue not found")
+    return await _download_media("venue", venue_oid, "venue_photo")
