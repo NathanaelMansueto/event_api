@@ -33,7 +33,7 @@ def serialize(doc: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(doc)
     out["id"] = str(out.pop("_id"))
 
-    # Convert any ObjectId fields to strings (venue_id, event_id, attendee_id, etc.)
+    #Convert any ObjectId fields to strings (venue_id, event_id, attendee_id, etc.)
     for k, v in list(out.items()):
         if isinstance(v, ObjectId):
             out[k] = str(v)
