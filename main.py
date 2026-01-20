@@ -17,6 +17,9 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 load_dotenv()
 
 app = FastAPI(title="Event Management API")
+@app.get("/")
+async def root():
+    return {"status": "running", "mongo_uri_exists": bool(os.getenv("MONGO_URI"))}
 
 MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
