@@ -5,30 +5,40 @@ from fastapi.responses import StreamingResponse
 from datetime import datetime
 import io
 from motor.motor_asyncio import AsyncIOMotorGridFSBucket
-
-from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
 import motor.motor_asyncio
 from bson import ObjectId
 from pydantic import BaseModel, Field, ConfigDict
-from fastapi import FastAPI, HTTPException, UploadFile, File
 
 
 load_dotenv()
 
 app = FastAPI(title="Event Management API")
-@app.get("/")
-async def root():
-    return {"status": "running", "mongo_uri_exists": bool(os.getenv("MONGO_URI"))}
 
 MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
-    raise RuntimeError("MONGO_URI is missing in .env")
+    raise RuntimeError("MONGO_URI is missing. Set it in .env locally or in Vercel Environment Variables.")
 
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-db = client["event_management_db"] 
-fs = AsyncIOMotorGridFSBucket(db, bucket_name="media")
+# Lazy connection - only connect when needed (fixes Vercel serverless issues)
+_client = None
+_db = None
+_fs = None
 
+
+def get_db():
+    global _client, _db, _fs
+    if _client is None:
+        _client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+        _db = _client["event_management_db"]
+        _fs = AsyncIOMotorGridFSBucket(_db, bucket_name="media")
+    return _db
+
+
+def get_fs():
+    global _client, _db, _fs
+    if _fs is None:
+        get_db()  # This initializes everything
+    return _fs
 
 
 # Helpers
@@ -45,7 +55,7 @@ def serialize(doc: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(doc)
     out["id"] = str(out.pop("_id"))
 
-    #Convert any ObjectId fields to strings (venue_id, event_id, attendee_id, etc.)
+    # Convert any ObjectId fields to strings (venue_id, event_id, attendee_id, etc.)
     for k, v in list(out.items()):
         if isinstance(v, ObjectId):
             out[k] = str(v)
@@ -116,7 +126,12 @@ class BookingUpdate(BaseModel):
     attendee_id: Optional[str] = None
 
 
-#Test
+# Root and Health endpoints
+@app.get("/")
+async def root():
+    return {"status": "running", "mongo_uri_exists": bool(os.getenv("MONGO_URI"))}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -125,28 +140,35 @@ async def health():
 # VENUES CRUD
 @app.post("/venues")
 async def create_venue(payload: VenueCreate):
+    db = get_db()
     result = await db["venues"].insert_one(payload.model_dump())
     created = await db["venues"].find_one({"_id": result.inserted_id})
     return serialize(created)
 
+
 @app.get("/venues")
 async def list_venues(limit: int = 50, skip: int = 0):
+    db = get_db()
     cursor = db["venues"].find().skip(skip).limit(limit)
     venues = []
     async for doc in cursor:
         venues.append(serialize(doc))
     return venues
 
+
 @app.get("/venues/{venue_id}")
 async def get_venue(venue_id: str):
+    db = get_db()
     oid = to_object_id(venue_id)
     doc = await db["venues"].find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail="Venue not found")
     return serialize(doc)
 
+
 @app.put("/venues/{venue_id}")
 async def update_venue(venue_id: str, payload: VenueUpdate):
+    db = get_db()
     oid = to_object_id(venue_id)
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
     if not updates:
@@ -159,8 +181,10 @@ async def update_venue(venue_id: str, payload: VenueUpdate):
     doc = await db["venues"].find_one({"_id": oid})
     return serialize(doc)
 
+
 @app.delete("/venues/{venue_id}")
 async def delete_venue(venue_id: str):
+    db = get_db()
     oid = to_object_id(venue_id)
     result = await db["venues"].delete_one({"_id": oid})
     if result.deleted_count == 0:
@@ -168,9 +192,10 @@ async def delete_venue(venue_id: str):
     return {"deleted": True, "id": venue_id}
 
 
-# EVENTS CRUD 
+# EVENTS CRUD
 @app.post("/events")
 async def create_event(payload: EventCreate):
+    db = get_db()
     venue_oid = to_object_id(payload.venue_id)
 
     venue = await db["venues"].find_one({"_id": venue_oid})
@@ -184,24 +209,30 @@ async def create_event(payload: EventCreate):
     created = await db["events"].find_one({"_id": result.inserted_id})
     return serialize(created)
 
+
 @app.get("/events")
 async def list_events(limit: int = 50, skip: int = 0):
+    db = get_db()
     cursor = db["events"].find().skip(skip).limit(limit)
     events = []
     async for doc in cursor:
         events.append(serialize(doc))
     return events
 
+
 @app.get("/events/{event_id}")
 async def get_event(event_id: str):
+    db = get_db()
     oid = to_object_id(event_id)
     doc = await db["events"].find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail="Event not found")
     return serialize(doc)
 
+
 @app.put("/events/{event_id}")
 async def update_event(event_id: str, payload: EventUpdate):
+    db = get_db()
     oid = to_object_id(event_id)
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
     if not updates:
@@ -221,8 +252,10 @@ async def update_event(event_id: str, payload: EventUpdate):
     doc = await db["events"].find_one({"_id": oid})
     return serialize(doc)
 
+
 @app.delete("/events/{event_id}")
 async def delete_event(event_id: str):
+    db = get_db()
     oid = to_object_id(event_id)
     result = await db["events"].delete_one({"_id": oid})
     if result.deleted_count == 0:
@@ -230,31 +263,38 @@ async def delete_event(event_id: str):
     return {"deleted": True, "id": event_id}
 
 
-#ATTENDEES CRUD
+# ATTENDEES CRUD
 @app.post("/attendees")
 async def create_attendee(payload: AttendeeCreate):
+    db = get_db()
     result = await db["attendees"].insert_one(payload.model_dump())
     created = await db["attendees"].find_one({"_id": result.inserted_id})
     return serialize(created)
 
+
 @app.get("/attendees")
 async def list_attendees(limit: int = 50, skip: int = 0):
+    db = get_db()
     cursor = db["attendees"].find().skip(skip).limit(limit)
     attendees = []
     async for doc in cursor:
         attendees.append(serialize(doc))
     return attendees
 
+
 @app.get("/attendees/{attendee_id}")
 async def get_attendee(attendee_id: str):
+    db = get_db()
     oid = to_object_id(attendee_id)
     doc = await db["attendees"].find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail="Attendee not found")
     return serialize(doc)
 
+
 @app.put("/attendees/{attendee_id}")
 async def update_attendee(attendee_id: str, payload: AttendeeUpdate):
+    db = get_db()
     oid = to_object_id(attendee_id)
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
     if not updates:
@@ -267,8 +307,10 @@ async def update_attendee(attendee_id: str, payload: AttendeeUpdate):
     doc = await db["attendees"].find_one({"_id": oid})
     return serialize(doc)
 
+
 @app.delete("/attendees/{attendee_id}")
 async def delete_attendee(attendee_id: str):
+    db = get_db()
     oid = to_object_id(attendee_id)
     result = await db["attendees"].delete_one({"_id": oid})
     if result.deleted_count == 0:
@@ -276,9 +318,10 @@ async def delete_attendee(attendee_id: str):
     return {"deleted": True, "id": attendee_id}
 
 
-#BOOKINGS CRUD 
+# BOOKINGS CRUD
 @app.post("/bookings")
 async def create_booking(payload: BookingCreate):
+    db = get_db()
     event_oid = to_object_id(payload.event_id)
     attendee_oid = to_object_id(payload.attendee_id)
 
@@ -298,24 +341,30 @@ async def create_booking(payload: BookingCreate):
     created = await db["bookings"].find_one({"_id": result.inserted_id})
     return serialize(created)
 
+
 @app.get("/bookings")
 async def list_bookings(limit: int = 50, skip: int = 0):
+    db = get_db()
     cursor = db["bookings"].find().skip(skip).limit(limit)
     bookings = []
     async for doc in cursor:
         bookings.append(serialize(doc))
     return bookings
 
+
 @app.get("/bookings/{booking_id}")
 async def get_booking(booking_id: str):
+    db = get_db()
     oid = to_object_id(booking_id)
     doc = await db["bookings"].find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail="Booking not found")
     return serialize(doc)
 
+
 @app.put("/bookings/{booking_id}")
 async def update_booking(booking_id: str, payload: BookingUpdate):
+    db = get_db()
     oid = to_object_id(booking_id)
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
     if not updates:
@@ -342,22 +391,28 @@ async def update_booking(booking_id: str, payload: BookingUpdate):
     doc = await db["bookings"].find_one({"_id": oid})
     return serialize(doc)
 
+
 @app.delete("/bookings/{booking_id}")
 async def delete_booking(booking_id: str):
+    db = get_db()
     oid = to_object_id(booking_id)
     result = await db["bookings"].delete_one({"_id": oid})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Booking not found")
     return {"deleted": True, "id": booking_id}
 
+
 # ---------- MEDIA (GridFS + metadata collection) ----------
 async def _ensure_exists(collection: str, oid: ObjectId, not_found_msg: str):
+    db = get_db()
     doc = await db[collection].find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail=not_found_msg)
 
 
 async def _upload_media(owner_type: str, owner_oid: ObjectId, media_type: str, file: UploadFile) -> dict:
+    db = get_db()
+    fs = get_fs()
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
@@ -393,6 +448,8 @@ async def _upload_media(owner_type: str, owner_oid: ObjectId, media_type: str, f
 
 
 async def _download_media(owner_type: str, owner_oid: ObjectId, media_type: str):
+    db = get_db()
+    fs = get_fs()
     meta = await db["media_files"].find_one(
         {"owner_type": owner_type, "owner_id": owner_oid, "media_type": media_type}
     )
