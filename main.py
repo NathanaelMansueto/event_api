@@ -19,7 +19,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI is missing. Set it in .env locally or in Vercel Environment Variables.")
 
-# Lazy connection - only connect when needed (fixes Vercel serverless issues)
+#Calling them when they are to be used
 _client = None
 _db = None
 _fs = None
@@ -37,7 +37,7 @@ def get_db():
 def get_fs():
     global _client, _db, _fs
     if _fs is None:
-        get_db()  # This initializes everything
+        get_db() 
     return _fs
 
 
@@ -55,7 +55,7 @@ def serialize(doc: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(doc)
     out["id"] = str(out.pop("_id"))
 
-    # Convert any ObjectId fields to strings (venue_id, event_id, attendee_id, etc.)
+    # Convert any ObjectId fields
     for k, v in list(out.items()):
         if isinstance(v, ObjectId):
             out[k] = str(v)
