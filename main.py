@@ -45,7 +45,7 @@ def get_fs():
 def to_object_id(id_str: str) -> ObjectId:
     if not ObjectId.is_valid(id_str):
         raise HTTPException(status_code=400, detail="Invalid ObjectId format")
-    return ObjectId(id_str)
+    return ObjectId(id_str) 
 
 
 def serialize(doc: Dict[str, Any]) -> Dict[str, Any]:
